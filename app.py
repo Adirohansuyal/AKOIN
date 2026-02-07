@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Query
-from pydantic import BaseModel
 import json
 import os
 from groq import Groq
@@ -9,7 +8,7 @@ from groq import Groq
 # ==============================
 
 client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")  # Render env var
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
 # ==============================
@@ -18,67 +17,63 @@ client = Groq(
 
 app = FastAPI(
     title="COREP Reporting Assistant",
-    version="1.0"
+    version="2.0"
 )
 
 # ==============================
-# LIGHTWEIGHT REGULATORY CORPUS
+# REGULATORY CORPUS
 # ==============================
 
-REGULATORY_RULES = [
-    {
-        "id": "Article 26",
-        "text": """
-        Article 26 – Common Equity Tier 1 Capital (CET1)
+REGULATORY_RULES = {
+    "C01.00": [
+        {
+            "id": "Article 26",
+            "text": """
+Article 26 – Common Equity Tier 1 Capital
 
-        CET1 includes:
+Includes:
+(a) Ordinary share capital
+(b) Retained earnings
 
-        (a) Ordinary share capital
-        (b) Retained earnings
-        (c) Accumulated other comprehensive income
+Report under COREP Template C01.00 Field 010.
+"""
+        },
+        {
+            "id": "Article 51",
+            "text": """
+Article 51 – Additional Tier 1 Capital
 
-        Report under COREP Template C01.00 – Field 010.
-        """
-    },
-    {
-        "id": "Article 51",
-        "text": """
-        Article 51 – Additional Tier 1 Capital (AT1)
+Includes perpetual subordinated instruments.
 
-        AT1 includes perpetual subordinated instruments
-        and hybrid capital instruments.
+Report under Template C01.00 Field 020.
+"""
+        }
+    ],
 
-        Report under Template C01.00 – Field 020.
-        """
-    }
-]
+    "C02.00": [
+        {
+            "id": "Article 92",
+            "text": """
+Article 92 – Capital Requirements
+
+Institutions must maintain minimum capital ratios
+against risk-weighted assets.
+
+Reported under COREP Template C02.00.
+"""
+        }
+    ]
+}
 
 # ==============================
-# SIMPLE KEYWORD RETRIEVAL
+# RETRIEVAL
 # ==============================
 
-def retrieve_context(query: str):
+def retrieve_context(template, query):
 
-    query_lower = query.lower()
-    matched_rules = []
+    rules = REGULATORY_RULES.get(template, [])
+    return "\n\n".join(rule["text"] for rule in rules)
 
-    for rule in REGULATORY_RULES:
-        if any(keyword in query_lower for keyword in [
-            "share", "equity", "cet1", "retained", "capital"
-        ]):
-            if "26" in rule["id"]:
-                matched_rules.append(rule["text"])
-
-        if any(keyword in query_lower for keyword in [
-            "tier 1", "at1", "hybrid"
-        ]):
-            if "51" in rule["id"]:
-                matched_rules.append(rule["text"])
-
-    if not matched_rules:
-        matched_rules.append("No specific regulatory rule matched.")
-
-    return "\n\n".join(matched_rules)
 
 # ==============================
 # LLM PROMPT
@@ -89,13 +84,10 @@ You are a PRA COREP regulatory reporting assistant.
 
 Return ONLY valid JSON.
 
-No explanations.
-No markdown.
-
 Schema:
 
 {
-  "template": "C01.00",
+  "template": "string",
   "fields": [
     {
       "code": "string",
@@ -109,17 +101,16 @@ Schema:
 }
 """
 
-# ==============================
-# LLM CALL
-# ==============================
 
-def generate_structured_output(query, context):
+def generate_structured_output(query, template, context):
 
     prompt = f"""
+Template: {template}
+
 Regulatory Context:
 {context}
 
-Reporting Scenario:
+Scenario:
 {query}
 """
 
@@ -134,73 +125,76 @@ Reporting Scenario:
 
     return response.choices[0].message.content
 
+
 # ==============================
 # TEMPLATE MAPPING
 # ==============================
 
 def map_to_template(structured_json):
 
-    template_rows = []
+    rows = []
 
     for field in structured_json["fields"]:
-        template_rows.append({
+        rows.append({
             "Field Code": field["code"],
             "Description": field["label"],
             "Value": field["value"],
             "Rule Source": field["source_rule"]
         })
 
-    return template_rows
+    return rows
+
 
 # ==============================
-# VALIDATION ENGINE
+# VALIDATION
 # ==============================
 
-def run_validations(structured_json):
+def run_validations(data):
 
     flags = []
 
     cet1_total = sum(
         f["value"]
-        for f in structured_json["fields"]
+        for f in data["fields"]
         if f["code"] == "010"
     )
 
     if cet1_total <= 0:
         flags.append("CET1 capital cannot be zero or negative.")
 
-    structured_json["validation_flags"] = flags
+    data["validation_flags"] = flags
 
-    return structured_json
+    return data
+
 
 # ==============================
 # API ENDPOINT
 # ==============================
 
 @app.post("/report")
-def generate_report(query: str = Query(...)):
+def generate_report(
+    query: str = Query(...),
+    template: str = Query("C01.00")
+):
 
-    # 1️⃣ Retrieve regulatory context
-    context = retrieve_context(query)
+    context = retrieve_context(template, query)
 
-    # 2️⃣ LLM structured output
-    llm_output = generate_structured_output(query, context)
+    llm_output = generate_structured_output(
+        query, template, context
+    )
 
     try:
         structured_json = json.loads(llm_output)
     except:
         return {
-            "error": "LLM did not return valid JSON",
+            "error": "Invalid JSON from LLM",
             "raw_output": llm_output
         }
 
-    # 3️⃣ Validation
     structured_json = run_validations(structured_json)
 
-    # 4️⃣ Template mapping
     template_extract = map_to_template(structured_json)
 
-    # 5️⃣ Audit log
     audit_log = context.split("\n\n")
 
     return {
@@ -208,3 +202,12 @@ def generate_report(query: str = Query(...)):
         "template_extract": template_extract,
         "audit_log": audit_log
     }
+
+
+# ==============================
+# HEALTH CHECK
+# ==============================
+
+@app.get("/")
+def root():
+    return {"status": "COREP backend running"}
