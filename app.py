@@ -1,123 +1,210 @@
-from fastapi import FastAPI
-from rag import RAGEngine
-from llm import generate_structured_output
-from validation import validate_corep
-from template_mapper import map_to_template
-from aggregator import aggregate_fields
-
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
 import json
+import os
+from groq import Groq
+
+# ==============================
+# GROQ CLIENT
+# ==============================
+
+client = Groq(
+    api_key=os.getenv("GROQ_API_KEY")  # Render env var
+)
+
+# ==============================
+# FASTAPI INIT
+# ==============================
 
 app = FastAPI(
-    title="LLM-Assisted COREP Reporting Assistant",
-    description="Prototype for PRA COREP regulatory reporting automation",
+    title="COREP Reporting Assistant",
     version="1.0"
 )
 
-# Initialize RAG engine
-rag = RAGEngine("data/regulatory_text.txt")
+# ==============================
+# LIGHTWEIGHT REGULATORY CORPUS
+# ==============================
 
+REGULATORY_RULES = [
+    {
+        "id": "Article 26",
+        "text": """
+        Article 26 – Common Equity Tier 1 Capital (CET1)
 
-# 🔒 Safe JSON parser
-def safe_json_loads(text: str):
-    """
-    Extracts JSON safely from LLM output.
-    Handles markdown, text wrapping, etc.
-    """
+        CET1 includes:
 
-    if not text:
-        raise ValueError("LLM returned empty output")
+        (a) Ordinary share capital
+        (b) Retained earnings
+        (c) Accumulated other comprehensive income
 
-    start = text.find("{")
-    end = text.rfind("}") + 1
+        Report under COREP Template C01.00 – Field 010.
+        """
+    },
+    {
+        "id": "Article 51",
+        "text": """
+        Article 51 – Additional Tier 1 Capital (AT1)
 
-    if start == -1 or end == -1:
-        raise ValueError(f"No JSON found in LLM output:\n{text}")
+        AT1 includes perpetual subordinated instruments
+        and hybrid capital instruments.
 
-    json_text = text[start:end]
-
-    return json.loads(json_text)
-
-
-@app.get("/")
-def root():
-    return {
-        "message": "COREP Reporting Assistant is running 🚀"
+        Report under Template C01.00 – Field 020.
+        """
     }
+]
 
+# ==============================
+# SIMPLE KEYWORD RETRIEVAL
+# ==============================
+
+def retrieve_context(query: str):
+
+    query_lower = query.lower()
+    matched_rules = []
+
+    for rule in REGULATORY_RULES:
+        if any(keyword in query_lower for keyword in [
+            "share", "equity", "cet1", "retained", "capital"
+        ]):
+            if "26" in rule["id"]:
+                matched_rules.append(rule["text"])
+
+        if any(keyword in query_lower for keyword in [
+            "tier 1", "at1", "hybrid"
+        ]):
+            if "51" in rule["id"]:
+                matched_rules.append(rule["text"])
+
+    if not matched_rules:
+        matched_rules.append("No specific regulatory rule matched.")
+
+    return "\n\n".join(matched_rules)
+
+# ==============================
+# LLM PROMPT
+# ==============================
+
+SYSTEM_PROMPT = """
+You are a PRA COREP regulatory reporting assistant.
+
+Return ONLY valid JSON.
+
+No explanations.
+No markdown.
+
+Schema:
+
+{
+  "template": "C01.00",
+  "fields": [
+    {
+      "code": "string",
+      "label": "string",
+      "value": number,
+      "source_rule": "string"
+    }
+  ],
+  "missing_data": [],
+  "validation_flags": []
+}
+"""
+
+# ==============================
+# LLM CALL
+# ==============================
+
+def generate_structured_output(query, context):
+
+    prompt = f"""
+Regulatory Context:
+{context}
+
+Reporting Scenario:
+{query}
+"""
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    return response.choices[0].message.content
+
+# ==============================
+# TEMPLATE MAPPING
+# ==============================
+
+def map_to_template(structured_json):
+
+    template_rows = []
+
+    for field in structured_json["fields"]:
+        template_rows.append({
+            "Field Code": field["code"],
+            "Description": field["label"],
+            "Value": field["value"],
+            "Rule Source": field["source_rule"]
+        })
+
+    return template_rows
+
+# ==============================
+# VALIDATION ENGINE
+# ==============================
+
+def run_validations(structured_json):
+
+    flags = []
+
+    cet1_total = sum(
+        f["value"]
+        for f in structured_json["fields"]
+        if f["code"] == "010"
+    )
+
+    if cet1_total <= 0:
+        flags.append("CET1 capital cannot be zero or negative.")
+
+    structured_json["validation_flags"] = flags
+
+    return structured_json
+
+# ==============================
+# API ENDPOINT
+# ==============================
 
 @app.post("/report")
-def generate_report(query: str):
+def generate_report(query: str = Query(...)):
+
+    # 1️⃣ Retrieve regulatory context
+    context = retrieve_context(query)
+
+    # 2️⃣ LLM structured output
+    llm_output = generate_structured_output(query, context)
 
     try:
-
-        print("\n==============================")
-        print("📩 NEW REPORT REQUEST")
-        print("==============================")
-        print("User Query:\n", query)
-
-        # --------------------------------------------------
-        # Step 1 — Retrieve regulatory rules (RAG)
-        # --------------------------------------------------
-        retrieved_chunks = rag.retrieve(query)
-
-        context = "\n".join(retrieved_chunks)
-
-        print("\n📚 Retrieved Regulatory Context:\n")
-        for i, chunk in enumerate(retrieved_chunks, 1):
-            print(f"\n--- Chunk {i} ---\n{chunk}")
-
-        # --------------------------------------------------
-        # Step 2 — LLM Structured Generation
-        # --------------------------------------------------
-        llm_output = generate_structured_output(query, context)
-
-        print("\n🤖 LLM RAW OUTPUT:\n")
-        print(llm_output)
-
-        # --------------------------------------------------
-        # Step 3 — Safe JSON Parsing
-        # --------------------------------------------------
-        data = safe_json_loads(llm_output)
-
-        print("\n🧾 Parsed Structured JSON:\n", data)
-
-        # --------------------------------------------------
-        # Step 4 — Aggregate duplicate COREP fields
-        # --------------------------------------------------
-        data = aggregate_fields(data)
-
-        print("\n🧮 Aggregated Fields:\n", data["fields"])
-
-        # --------------------------------------------------
-        # Step 5 — Validation Rules
-        # --------------------------------------------------
-        validated_data = validate_corep(data)
-
-        print("\n✅ Validation Flags:\n", validated_data["validation_flags"])
-
-        # --------------------------------------------------
-        # Step 6 — Map to Template Extract
-        # --------------------------------------------------
-        template_df = map_to_template(validated_data)
-
-        template_records = template_df.to_dict(orient="records")
-
-        print("\n📊 Template Extract:\n", template_records)
-
-        # --------------------------------------------------
-        # Final Response
-        # --------------------------------------------------
+        structured_json = json.loads(llm_output)
+    except:
         return {
-            "structured_output": validated_data,
-            "template_extract": template_records,
-            "audit_log": retrieved_chunks
+            "error": "LLM did not return valid JSON",
+            "raw_output": llm_output
         }
 
-    except Exception as e:
+    # 3️⃣ Validation
+    structured_json = run_validations(structured_json)
 
-        print("\n❌ ERROR OCCURRED:\n", str(e))
+    # 4️⃣ Template mapping
+    template_extract = map_to_template(structured_json)
 
-        return {
-            "error": str(e),
-            "hint": "Check terminal logs for LLM output / JSON formatting issues"
-        }
+    # 5️⃣ Audit log
+    audit_log = context.split("\n\n")
+
+    return {
+        "structured_output": structured_json,
+        "template_extract": template_extract,
+        "audit_log": audit_log
+    }
