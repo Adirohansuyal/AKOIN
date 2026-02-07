@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Query
-from pydantic import BaseModel
 import json
 import os
 from groq import Groq
@@ -9,7 +8,7 @@ from groq import Groq
 # ==============================
 
 client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")  # Render env var
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
 # ==============================
@@ -22,75 +21,65 @@ app = FastAPI(
 )
 
 # ==============================
-# LIGHTWEIGHT REGULATORY CORPUS
+# REGULATORY CORPUS
 # ==============================
 
 REGULATORY_RULES = [
     {
         "id": "Article 26",
         "text": """
-        Article 26 – Common Equity Tier 1 Capital (CET1)
+Article 26 – Common Equity Tier 1 Capital (CET1)
 
-        CET1 includes:
+Includes:
+• Ordinary share capital
+• Retained earnings
+• Accumulated OCI
 
-        (a) Ordinary share capital
-        (b) Retained earnings
-        (c) Accumulated other comprehensive income
-
-        Report under COREP Template C01.00 – Field 010.
-        """
+Reported in COREP Template C01.00 – Field 010.
+"""
     },
     {
         "id": "Article 51",
         "text": """
-        Article 51 – Additional Tier 1 Capital (AT1)
+Article 51 – Additional Tier 1 Capital (AT1)
 
-        AT1 includes perpetual subordinated instruments
-        and hybrid capital instruments.
+Includes:
+• Perpetual subordinated instruments
+• Hybrid capital
 
-        Report under Template C01.00 – Field 020.
-        """
+Reported in Template C01.00 – Field 020.
+"""
     }
 ]
 
 # ==============================
-# SIMPLE KEYWORD RETRIEVAL
+# RETRIEVAL
 # ==============================
 
 def retrieve_context(query: str):
 
-    query_lower = query.lower()
-    matched_rules = []
+    q = query.lower()
+    matches = []
 
-    for rule in REGULATORY_RULES:
-        if any(keyword in query_lower for keyword in [
-            "share", "equity", "cet1", "retained", "capital"
-        ]):
-            if "26" in rule["id"]:
-                matched_rules.append(rule["text"])
+    if any(k in q for k in ["share", "equity", "retained"]):
+        matches.append(REGULATORY_RULES[0]["text"])
 
-        if any(keyword in query_lower for keyword in [
-            "tier 1", "at1", "hybrid"
-        ]):
-            if "51" in rule["id"]:
-                matched_rules.append(rule["text"])
+    if any(k in q for k in ["tier 1", "at1"]):
+        matches.append(REGULATORY_RULES[1]["text"])
 
-    if not matched_rules:
-        matched_rules.append("No specific regulatory rule matched.")
+    if not matches:
+        matches.append("No rule matched.")
 
-    return "\n\n".join(matched_rules)
+    return "\n\n".join(matches)
 
 # ==============================
 # LLM PROMPT
 # ==============================
 
 SYSTEM_PROMPT = """
-You are a PRA COREP regulatory reporting assistant.
+You are a PRA COREP reporting assistant.
 
 Return ONLY valid JSON.
-
-No explanations.
-No markdown.
 
 Schema:
 
@@ -109,17 +98,13 @@ Schema:
 }
 """
 
-# ==============================
-# LLM CALL
-# ==============================
-
 def generate_structured_output(query, context):
 
     prompt = f"""
 Regulatory Context:
 {context}
 
-Reporting Scenario:
+Scenario:
 {query}
 """
 
@@ -138,73 +123,72 @@ Reporting Scenario:
 # TEMPLATE MAPPING
 # ==============================
 
-def map_to_template(structured_json):
+def map_template(data):
 
-    template_rows = []
+    rows = []
 
-    for field in structured_json["fields"]:
-        template_rows.append({
-            "Field Code": field["code"],
-            "Description": field["label"],
-            "Value": field["value"],
-            "Rule Source": field["source_rule"]
+    for f in data["fields"]:
+        rows.append({
+            "Field Code": f["code"],
+            "Description": f["label"],
+            "Value": f["value"],
+            "Rule Source": f["source_rule"]
         })
 
-    return template_rows
+    return rows
 
 # ==============================
-# VALIDATION ENGINE
+# VALIDATION
 # ==============================
 
-def run_validations(structured_json):
+def validate(data):
 
     flags = []
 
-    cet1_total = sum(
+    total_cet1 = sum(
         f["value"]
-        for f in structured_json["fields"]
+        for f in data["fields"]
         if f["code"] == "010"
     )
 
-    if cet1_total <= 0:
-        flags.append("CET1 capital cannot be zero or negative.")
+    if total_cet1 <= 0:
+        flags.append("CET1 cannot be zero.")
 
-    structured_json["validation_flags"] = flags
+    data["validation_flags"] = flags
 
-    return structured_json
+    return data
 
 # ==============================
-# API ENDPOINT
+# API
 # ==============================
+
+@app.get("/")
+def health():
+    return {"status": "Backend running"}
 
 @app.post("/report")
 def generate_report(query: str = Query(...)):
 
-    # 1️⃣ Retrieve regulatory context
     context = retrieve_context(query)
 
-    # 2️⃣ LLM structured output
     llm_output = generate_structured_output(query, context)
 
     try:
-        structured_json = json.loads(llm_output)
+        structured = json.loads(llm_output)
     except:
         return {
-            "error": "LLM did not return valid JSON",
-            "raw_output": llm_output
+            "error": "Invalid JSON from LLM",
+            "raw": llm_output
         }
 
-    # 3️⃣ Validation
-    structured_json = run_validations(structured_json)
+    structured = validate(structured)
 
-    # 4️⃣ Template mapping
-    template_extract = map_to_template(structured_json)
+    template = map_template(structured)
 
-    # 5️⃣ Audit log
     audit_log = context.split("\n\n")
 
     return {
-        "structured_output": structured_json,
-        "template_extract": template_extract,
+        "structured_output": structured,
+        "template_extract": template,
         "audit_log": audit_log
     }
