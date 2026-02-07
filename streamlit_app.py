@@ -41,7 +41,8 @@ st.sidebar.info(
 # API Endpoint
 # ----------------------------------------
 
-API_URL = "http://backend:8000/report"
+ API_URL = "https://corep-backend.onrender.com/report"
+
 
 
 # ----------------------------------------
