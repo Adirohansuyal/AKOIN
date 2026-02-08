@@ -2,7 +2,7 @@
 
 An LLM-powered prototype for automating PRA COREP regulatory reporting using RAG (Retrieval-Augmented Generation) and structured output generation.
 
-## Overview
+## Overview of the System
 
 This system assists financial institutions in generating COREP (Common Reporting) templates by combining regulatory knowledge retrieval with LLM-based data extraction and validation.
 
